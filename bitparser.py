@@ -79,22 +79,25 @@ class Struct (object):
         return sum(f.size() for f in self.fields)
 
     def unpack(self, fd):
-        '''Convert a binary stream into structured data.'''
-
         values = self.factory(self)
+
+        for name, val in self.iterunpack(fd):
+            values[name] = val
+
+        return values
+
+    def iterunpack(self, fd):
+        '''Convert a binary stream into structured data.'''
 
         data = fd.read(self.size())
         fd.pushback(data)
-
         if len(data) < self.size():
             raise EndOfData()
 
         for f in self.fields:
             val = f.unpack(fd)
             print 'Unpacked %s = %s' % (f.name, repr(val))
-            values[f.name] = val
-
-        return values
+            yield(f.name, val)
 
     def pack(self, values):
         '''Convert structured data into a binary stream.'''
