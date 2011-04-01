@@ -11,10 +11,11 @@ class BufferedReader (object):
     '''Provides peek() and pushback() methods for a Python file object.'''
 
     def __init__(self, fd, bufsize=4096):
-        self._read = fd.read
         self.held = ''
         self.eof = False
-        self.bufsize=bufsize
+        self.fd = fd
+
+        self.bufsize = bufsize
 
     def read(self, length):
         '''Return no more than length bytes of data to the caller.'''
@@ -22,7 +23,7 @@ class BufferedReader (object):
         assert length > 0
 
         while len(self.held) < length and not self.eof:
-            chunk = self._read(self.bufsize)
+            chunk = self.fd.read(self.bufsize)
             if chunk:
                 self.held += chunk
             else:
@@ -48,12 +49,26 @@ class BufferedReader (object):
 
         bytes = self.read(length)
         self.pushback(bytes)
-        return data
+        return bytes
+
+    def seek(self, *args, **kwargs):
+        '''Calls self.fd seek(...) after invalidating the read buffer.'''
+        self.held = ''
+        self.eof = False
+        return self.fd.seek(*args, **kwargs)
+
+    def __getattr__(self, k):
+        return getattr(self.fd, k)
 
 class Container(dict):
     def __init__ (self, struct, *args, **kwargs):
-        super(Container, self).__init__(*args, **kwargs)
         self.__struct__ = struct
+
+        if 'fd' in kwargs:
+            self.__file__ = kwargs['fd']
+            del kwargs['fd']
+
+        super(Container, self).__init__(*args, **kwargs)
 
     def pack(self):
         '''Return the binary representation of this object.'''
@@ -66,7 +81,13 @@ class Container(dict):
 
         fd.write(self.pack())
 
+    def fd(self):
+        return self.__file__
+
 class Struct (object):
+    '''Converts between a binary stream of data and a structured
+    representation.'''
+
     def __init__ (self, *fields, **kwargs):
         self.fields = fields
         self.factory = kwargs.get('factory', Container)
@@ -79,7 +100,14 @@ class Struct (object):
         return sum(f.size() for f in self.fields)
 
     def unpack(self, fd):
-        values = self.factory(self)
+        '''Convert a binary stream into structured data.'''
+
+        # Make sure we're using a BufferedReader, since we require
+        # the pusbpack() method.
+        if not isinstance(fd, BufferedReader):
+            fd = BufferedReader(fd)
+
+        values = self.factory(self, fd=fd)
 
         for name, val in self.iterunpack(fd):
             values[name] = val
@@ -89,6 +117,9 @@ class Struct (object):
     def iterunpack(self, fd):
         '''Convert a binary stream into structured data.'''
 
+        # Check if there is enough data left to satisfy
+        # this Struct.  If we find less than self.size()
+        # data, put it back and raise EndOfData.
         data = fd.read(self.size())
         fd.pushback(data)
         if len(data) < self.size():
@@ -96,7 +127,6 @@ class Struct (object):
 
         for f in self.fields:
             val = f.unpack(fd)
-            print 'Unpacked %s = %s' % (f.name, repr(val))
             yield(f.name, val)
 
     def pack(self, values):
@@ -105,39 +135,55 @@ class Struct (object):
         bytes = []
 
         for f in self.fields:
-            val = values.get(f.name, getattr(f, 'default', None))
-            print 'Packing %s = %s' % (f.name, repr(val))
+            val = values.get(f.name, f.default)
             bytes.append(f.pack(val))
 
         return ''.join(bytes)
 
-class Alias(object):
+    def new(self):
+        data = self.factory(self)
+
+        for f in self.fields:
+            data[f.name] = f.default
+
+        return data
+
+class BaseField (object):
+    def __init__(self, name, default=None, **kwargs):
+        self.name = name
+        self.default = default
+
+    def set_default(self, v):
+        self._default = v
+
+    def get_default(self):
+        if callable(self._default):
+            return self._default()
+        else:
+            return self._default
+
+    default = property(get_default, set_default)
+
+class Alias(BaseField):
     '''Embed an anonymous Struct inside another struct by given it a name
     and default value.'''
 
-    def __init__ (self, struct, name, default=None):
-        self.name = name
+    def __init__ (self, name, struct, **kwargs):
+        super(Alias, self).__init__(name, **kwargs)
         self.struct = struct
-
-        if default is None:
-            default = {}
-
-        self.default = default
 
     def __getattr__ (self, k):
         return getattr(self.struct, k)
 
-class Array (object):
+class Array (BaseField):
     '''A fixed-length, multiple-value field.'''
 
-    def __init__ (self, name, format, default=None):
-        self.name = name
+    def __init__ (self, name, format, default=None, **kwargs):
         self.struct = struct.Struct(format)
-
         if default is None:
             default = (0,) * self.size()
 
-        self.default = default
+        super(Array, self).__init__(name, default=default, **kwargs)
 
     def read(self, fd, size):
         bytes = fd.read(size)
@@ -161,8 +207,8 @@ class Array (object):
 class Field (Array):
     '''A fixed-length, single-value field.'''
 
-    def __init__(self, name, format, default=0):
-        super(Field, self).__init__(name, format, default=default)
+    def __init__(self, name, format, default=0, **kwargs):
+        super(Field, self).__init__(name, format, default=default, **kwargs)
 
     def unpack(self, fd):
         return super(Field, self).unpack(fd)[0]
@@ -177,7 +223,7 @@ class Constant (Field):
     constant value.'''
 
     def __init__(self, name, format, value, **kwargs):
-        super(Constant, self).__init__(name, format, **kwargs)
+        super(Constant, self).__init__(name, format, default=value, **kwargs)
         self.value = value
 
     def pack(self, data):
@@ -219,8 +265,11 @@ class CString (Field):
 class BitField (Field):
     '''Treat an integer field as a list of boolean values.'''
 
-    def __init__(self, name, format, fields, **kwargs):
-        super(Field, self).__init__(name, format, **kwargs)
+    def __init__(self, name, format, fields, default=None, **kwargs):
+        if default is None:
+            default = dict(zip(fields, [False] * len(fields)))
+
+        super(Field, self).__init__(name, format, default=default, **kwargs)
         self.fields = fields
 
     def unpack(self, fd):
